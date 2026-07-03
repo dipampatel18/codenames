@@ -151,6 +151,18 @@ function createRoom(threeTeam, isPublic) {
   return rooms[code];
 }
 
+/* Rooms self-heal: entering any valid 4-char code joins the existing room or
+   instantly recreates it. This survives Render free-tier cold starts / recycles,
+   where in-memory rooms would otherwise vanish and show "room closed". */
+function ensureRoom(code, threeTeam) {
+  if (!/^[A-Z0-9]{4}$/.test(code || '')) return null;
+  if (!rooms[code]) {
+    rooms[code] = { code, threeTeam: !!threeTeam, public: false, players: {}, clients: [], lastActive: Date.now(), game: dealGame(!!threeTeam) };
+  }
+  rooms[code].lastActive = Date.now();
+  return rooms[code];
+}
+
 function aliveTeams(g) { return g.teams.filter((t) => !g.eliminated[t]); }
 
 function nextTeam(g) {
@@ -300,8 +312,10 @@ function handleAction(path, q) {
     return { ok: true, code: room.code, team: seat.team, role: seat.role };
   }
 
-  // room-scoped actions
-  const room = rooms[q.room];
+  // room-scoped actions (self-healing: any valid code re-creates its room)
+  const code = (q.room || '').toUpperCase();
+  const room = path === '/leave' ? rooms[code] : ensureRoom(code);
+  if (path === '/leave' && !room) return { ok: true };
   if (!room) return { ok: false, error: 'no_room' };
   const g = room.game;
   const id = q.id;
@@ -403,7 +417,7 @@ const server = http.createServer((req, res) => {
       'X-Accel-Buffering': 'no',
     });
     res.write('retry: 3000\n\n');
-    const room = rooms[q.room];
+    const room = ensureRoom((q.room || '').toUpperCase());
     if (!room) { res.write('data: ' + JSON.stringify({ error: 'no_room' }) + '\n\n'); res.end(); return; }
     const client = { id: q.id || 'anon', res };
     room.clients.push(client);
@@ -414,7 +428,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (path === '/state') {
-    const room = rooms[q.room];
+    const room = ensureRoom((q.room || '').toUpperCase());
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(room ? stateFor(room, q.id || 'anon') : { error: 'no_room' }));
     return;
@@ -512,11 +526,12 @@ const PAGE = `<!DOCTYPE html>
   .hero .tl{font-family:var(--mono); font-size:10px; letter-spacing:.24em; color:var(--muted2); text-transform:uppercase; margin-top:8px}
   .home-actions{display:flex; flex-direction:column; gap:11px}
   .bigbtn{padding:16px; border-radius:12px; border:1px solid var(--line); background:linear-gradient(180deg,var(--panel),var(--panel2)); color:var(--txt); text-align:left; cursor:pointer; display:flex; align-items:center; gap:13px}
-  .bigbtn .em{font-size:22px; width:26px; text-align:center}
-  .bigbtn .t{font-family:var(--mono); font-weight:700; letter-spacing:.12em; text-transform:uppercase; font-size:14px}
-  .bigbtn .d{font-size:11px; color:var(--muted); margin-top:2px}
-  .bigbtn.primary{background:linear-gradient(180deg,var(--amber-soft),var(--amber)); border:none; color:#1a1205}
-  .bigbtn.primary .d{color:#5c4410}
+  .bigbtn .em{font-size:22px; width:26px; text-align:center; flex:0 0 auto}
+  .bigbtn > span:nth-child(2){display:flex; flex-direction:column; min-width:0}
+  .bigbtn .t{display:block; font-family:var(--mono); font-weight:700; letter-spacing:.12em; text-transform:uppercase; font-size:14px}
+  .bigbtn .d{display:block; font-size:11px; color:var(--muted); margin-top:3px; text-transform:none; letter-spacing:normal; line-height:1.35}
+  .bigbtn.accent{background:linear-gradient(180deg,var(--amber-soft),var(--amber)); border:none; color:#1a1205}
+  .bigbtn.accent .d{color:#5c4410}
   .bigbtn:active{transform:translateY(1px)}
   .joinrow{display:flex; gap:9px}
   .joinrow input{flex:1; text-transform:uppercase; letter-spacing:.26em; text-align:center; font-family:var(--mono); font-weight:700}
@@ -691,7 +706,7 @@ const PAGE = `<!DOCTYPE html>
         <div class="tl">Two spymasters. One assassin. Clearance required.</div>
       </div>
       <div class="home-actions">
-        <button class="bigbtn primary" id="createBtn"><span class="em">✦</span><span><span class="t">Create room</span><span class="d">Start a game and get a code to share</span></span></button>
+        <button class="bigbtn accent" id="createBtn"><span class="em">✦</span><span><span class="t">Create room</span><span class="d">Start a game and get a code to share</span></span></button>
         <div class="joinrow">
           <input type="text" id="codeIn" maxlength="4" placeholder="CODE" autocomplete="off" autocapitalize="characters" inputmode="text">
           <button class="btn go" id="joinCodeBtn" style="padding:0 18px">Join</button>
@@ -843,7 +858,7 @@ function openStream(){
   es = new EventSource('/events?room='+encodeURIComponent(room)+'&id='+encodeURIComponent(myId));
   es.onmessage=function(ev){
     var s=JSON.parse(ev.data);
-    if(s.error==='no_room'){ es.close(); es=null; toast('That room has closed.', true); goHome(); return; }
+    if(s.error==='no_room'){ es.close(); es=null; goHome(); return; }
     state=s; setConn(true); onState();
   };
   es.onerror=function(){ setConn(false); };
@@ -863,7 +878,9 @@ function showScreen(name){
   var inRoom = (name!=='home');
   $('menuBtn').classList.toggle('hidden', name!=='game');
   $('codeChip').classList.toggle('hidden', !inRoom || !room);
+  var conn=document.querySelector('.conn'); if(conn) conn.style.display = (name==='home') ? 'none' : '';
   if(room) $('codeChip').textContent=room;
+  if(state){ if(name==='game') renderGame(mySeat()); else if(name==='lobby') renderLobby(); }
 }
 function goHome(){
   if(es){ es.close(); es=null; }
@@ -883,10 +900,8 @@ function enterRoom(code, autoseat){
 }
 
 /* ============================ home actions ============================ */
-$('createBtn').addEventListener('click', function(){
-  unlock();
-  api('/create', { three:0 }).then(function(res){ if(res.code){ pick.role='spymaster'; enterRoom(res.code, false); } });
-});
+function makeCodeLocal(){ var A='ABCDEFGHJKMNPQRSTUVWXYZ23456789', s=''; for(var i=0;i<4;i++){ s+=A.charAt(Math.floor(Math.random()*A.length)); } return s; }
+$('createBtn').addEventListener('click', function(){ unlock(); pick.role='spymaster'; enterRoom(makeCodeLocal(), false); });
 $('joinCodeBtn').addEventListener('click', function(){
   var code=$('codeIn').value.trim().toUpperCase();
   if(code.length!==4){ toast('Enter the 4-letter code.', true); return; }
@@ -1148,11 +1163,17 @@ function renderControls(seat){
     return;
   }
   var myTurn = seat.team===state.currentTeam;
+  function teamHas(role){ return state.players.some(function(p){ return p.team===seat.team && p.role===role; }); }
 
   if(seat.role==='spymaster'){
     if(!myTurn){ box.appendChild(el('div',{ class:'ctitle', text:'Spymaster · standby' })); box.appendChild(el('div',{ class:'waiting', text:'It is '+TEAMS[state.currentTeam]+"'s turn. You transmit when control returns to your team." })); return; }
-    if(state.clue){ box.appendChild(el('div',{ class:'ctitle', text:'Clue transmitted' })); box.appendChild(el('div',{ class:'waiting', text:'Your operatives are guessing. Sit tight until the turn ends.' })); return; }
+    if(state.clue){
+      box.appendChild(el('div',{ class:'ctitle', text:'Clue transmitted' }));
+      box.appendChild(el('div',{ class:'waiting', text: teamHas('operative') ? 'Your operatives are guessing. Sit tight until the turn ends.' : 'No operative has joined your team yet — a teammate must join this room as Operative to make guesses.' }));
+      return;
+    }
     box.appendChild(el('div',{ class:'ctitle', text:'Transmit a clue' }));
+    if(!teamHas('operative')) box.appendChild(el('div',{ class:'waiting', style:'margin-bottom:8px', text:'Heads up: no operative on your team yet. Someone needs to join as Operative to guess your clues.' }));
     var word=el('input',{ type:'text', id:'clueWord', placeholder:'one word', autocomplete:'off' });
     var sel=el('select',{ class:'numsel', id:'clueNum' });
     for(var n=0;n<=9;n++){ sel.appendChild(el('option',{ value:String(n), text: n===0?'∞':String(n) })); }
@@ -1174,7 +1195,7 @@ function renderControls(seat){
 
   // operative
   if(!myTurn){ box.appendChild(el('div',{ class:'ctitle', text:'Operative · standby' })); box.appendChild(el('div',{ class:'waiting', text:TEAMS[state.currentTeam]+' is up. Wait for control to pass to your team.' })); return; }
-  if(!state.clue){ box.appendChild(el('div',{ class:'ctitle', text:'Operative · ready' })); box.appendChild(el('div',{ class:'waiting', text:'Waiting for your spymaster. When a clue arrives, tap the cards you think are yours.' })); return; }
+  if(!state.clue){ box.appendChild(el('div',{ class:'ctitle', text:'Operative · ready' })); box.appendChild(el('div',{ class:'waiting', text: teamHas('spymaster') ? 'Waiting for your spymaster. When a clue arrives, tap the cards you think are yours.' : 'Your team has no spymaster yet — someone needs to join this room as Spymaster to send clues.' })); return; }
   box.appendChild(el('div',{ class:'ctitle', text:'Your move — tap a card to guess' }));
   box.appendChild(el('button',{ class:'btn wide', text:'End turn', onClick:function(){ api('/endturn', { room:room, id:myId }); } }));
 }
@@ -1196,9 +1217,7 @@ window.addEventListener('orientationchange', function(){ setTimeout(fitViewport,
   showScreen('home');
   setConn(false);
   var hash = (location.hash||'').replace('#','').trim().toUpperCase();
-  var saved = (localStorage.getItem('cn_room')||'').toUpperCase();
-  var code = hash || saved;
-  if(code && /^[A-Z0-9]{4}$/.test(code)){ enterRoom(code, false); }
+  if(hash && /^[A-Z0-9]{4}$/.test(hash)){ enterRoom(hash, false); }
 })();
 window.addEventListener('hashchange', function(){
   var h=(location.hash||'').replace('#','').trim().toUpperCase();
