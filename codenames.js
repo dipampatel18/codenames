@@ -246,6 +246,14 @@ function autoSeat(room, id, name) {
   return { team, role: setSeat(room, id, name, team, hasSpy ? 'operative' : 'spymaster') };
 }
 
+function teamSpymaster(room, team) {
+  return Object.keys(room.players).find((pid) => room.players[pid].team === team && room.players[pid].role === 'spymaster') || null;
+}
+
+/* a transient message shown to everyone (like a clue) via a toast on each client.
+   `by` is the acting player's id, so their own client can skip the toast. */
+function pushNotice(room, text, by) { room.notice = { seq: ++seq, text, by: by || null }; }
+
 /* ------------------- per-player view (anti-cheat) -------------------- */
 function stateFor(room, id) {
   const g = room.game;
@@ -269,6 +277,11 @@ function stateFor(room, id) {
     players: Object.keys(room.players).map((pid) => ({
       id: pid, name: room.players[pid].name, team: room.players[pid].team, role: room.players[pid].role,
     })),
+    seatRequest: room.seatRequest ? {
+      seq: room.seatRequest.seq, fromId: room.seatRequest.fromId, fromName: room.seatRequest.fromName,
+      targetId: room.seatRequest.targetId, targetName: room.seatRequest.targetName, team: room.seatRequest.team,
+    } : null,
+    notice: room.notice || null,
     log: g.log.slice(-40),
   };
 }
@@ -287,6 +300,9 @@ setInterval(() => {
     const room = rooms[code];
     room.clients = room.clients.filter((c) => !c.res.writableEnded);
     for (const c of room.clients) { try { c.res.write(':\n\n'); } catch (e) {} }
+    if (room.seatRequest && Date.now() - room.seatRequest.ts > 45000) {
+      room.seatRequest = null; pushNotice(room, 'A seat request expired.'); broadcast(room);
+    }
     if (room.clients.length === 0 && Date.now() - room.lastActive > 30 * 60 * 1000) delete rooms[code];
   }
 }, 25000);
@@ -300,14 +316,19 @@ function handleAction(path, q) {
   }
   if (path === '/quick') {
     const name = (q.name || '').toString().trim().slice(0, 20) || 'Agent';
-    let room = null;
+    const QUICK_CAP = 4; // a full 2v2 game per code; a 5th player starts a new room
+    let room = null, best = -1;
     for (const code of Object.keys(rooms)) {
       const r = rooms[code];
-      if (r.public && !r.game.winner && Object.keys(r.players).length < 6) { room = r; break; }
+      if (!r.public || r.game.winner) continue;
+      const n = Object.keys(r.players).length;
+      if (n >= QUICK_CAP) continue;
+      if (n > best) { best = n; room = r; } // fill the fullest open room first
     }
     if (!room) room = createRoom(false, true);
     const seat = autoSeat(room, q.id, name);
     room.game.log.push(name + ' was matched to ' + TEAM_NAME[seat.team] + ' (' + cap(seat.role) + ').');
+    pushNotice(room, name + ' joined ' + TEAM_NAME[seat.team] + ' (' + cap(seat.role) + ').', q.id);
     broadcast(room);
     return { ok: true, code: room.code, team: seat.team, role: seat.role };
   }
@@ -333,7 +354,61 @@ function handleAction(path, q) {
   }
 
   if (path === '/leave') {
-    if (p) { g.log.push(p.name + ' left the room.'); delete room.players[id]; broadcast(room); }
+    if (p) {
+      const rq = room.seatRequest;
+      if (rq && (rq.fromId === id || rq.targetId === id)) { room.seatRequest = null; pushNotice(room, 'A seat request was cancelled.', id); }
+      g.log.push(p.name + ' left the room.');
+      delete room.players[id];
+      broadcast(room);
+    }
+    return { ok: true };
+  }
+
+  if (path === '/takeseat') {
+    const name = (q.name || '').toString().trim().slice(0, 20) || 'Agent';
+    const team = q.team === 'blue' ? 'blue' : q.team === 'yellow' ? 'yellow' : 'red';
+    if (!g.teams.includes(team)) return { ok: false, error: 'That team is not in this game.' };
+    const wanted = q.role === 'spymaster' ? 'spymaster' : 'operative';
+    if (wanted === 'spymaster') {
+      const holder = teamSpymaster(room, team);
+      if (holder && holder !== id) {
+        if (room.seatRequest) return { ok: false, error: 'Another seat request is already pending.' };
+        room.seatRequest = { seq: ++seq, fromId: id, fromName: name, targetId: holder, targetName: room.players[holder].name, team, ts: Date.now() };
+        pushNotice(room, name + ' is requesting the ' + TEAM_NAME[team] + ' spymaster seat.', id);
+        g.log.push(name + ' requested the ' + TEAM_NAME[team] + ' spymaster seat.');
+        broadcast(room);
+        return { ok: true, pending: true, targetName: room.players[holder].name, team };
+      }
+    }
+    const role = setSeat(room, id, name, team, wanted);
+    pushNotice(room, name + ' took ' + TEAM_NAME[team] + ' ' + cap(role) + '.', id);
+    g.log.push(name + ' is now ' + TEAM_NAME[team] + ' ' + cap(role) + '.');
+    broadcast(room);
+    return { ok: true, applied: true, role };
+  }
+
+  if (path === '/seatrespond') {
+    const rq = room.seatRequest;
+    if (!rq || rq.targetId !== id) return { ok: false, error: 'No seat request awaiting your response.' };
+    room.seatRequest = null;
+    if (q.accept === '1') {
+      // incumbent (responder) steps down to operative; requester takes spymaster
+      room.players[id] = { name: room.players[id].name, team: rq.team, role: 'operative' };
+      const rn = room.players[rq.fromId] ? room.players[rq.fromId].name : rq.fromName;
+      room.players[rq.fromId] = { name: rn, team: rq.team, role: 'spymaster' };
+      pushNotice(room, rn + ' is now the ' + TEAM_NAME[rq.team] + ' spymaster.', id);
+      g.log.push(rn + ' took the ' + TEAM_NAME[rq.team] + ' spymaster seat (approved).');
+    } else {
+      pushNotice(room, 'The ' + TEAM_NAME[rq.team] + ' spymaster declined the seat request.', id);
+      g.log.push('A seat request for ' + TEAM_NAME[rq.team] + ' spymaster was declined.');
+    }
+    broadcast(room);
+    return { ok: true };
+  }
+
+  if (path === '/seatcancel') {
+    const rq = room.seatRequest;
+    if (rq && rq.fromId === id) { room.seatRequest = null; pushNotice(room, rq.fromName + ' cancelled the seat request.', id); broadcast(room); }
     return { ok: true };
   }
 
@@ -434,7 +509,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (['/create', '/quick', '/join', '/leave', '/newgame', '/clue', '/guess', '/endturn'].includes(path)) {
+  if (['/create', '/quick', '/join', '/leave', '/takeseat', '/seatrespond', '/seatcancel', '/newgame', '/clue', '/guess', '/endturn'].includes(path)) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(handleAction(path, q)));
     return;
@@ -719,7 +794,6 @@ const PAGE = `<!DOCTYPE html>
         </div>
         <button class="bigbtn" id="quickBtn"><span class="em">⚡</span><span><span class="t">Quick match</span><span class="d">Get dropped into an open game — no code needed</span></span></button>
       </div>
-      <div class="credit">Same Wi-Fi works with no internet · online rooms just need the code</div>
     </section>
 
     <!-- LOBBY -->
@@ -822,6 +896,7 @@ var state = null;
 var es = null;
 var screen = 'home';
 var lastSeq = -1, firstState = true, priorWinner = null;
+var lastNoticeSeq = -1, myPendingTeam = null, seatReqSeqShown = null, currentModal = null;
 
 /* ============================ sound (Web Audio) ============================ */
 var AC=null;
@@ -891,6 +966,7 @@ function showScreen(name){
 function goHome(){
   if(es){ es.close(); es=null; }
   room=null; joined=false; state=null; setConn(false); $('connTxt').textContent='';
+  myPendingTeam=null; seatReqSeqShown=null; if(currentModal) closeModal();
   try{ history.replaceState(null,'',location.pathname); }catch(e){}
   localStorage.removeItem('cn_room');
   showScreen('home');
@@ -899,7 +975,7 @@ function enterRoom(code, autoseat){
   room=code.toUpperCase();
   localStorage.setItem('cn_room', room);
   try{ history.replaceState(null,'','#'+room); }catch(e){}
-  firstState=true; lastSeq=-1; priorWinner=null;
+  firstState=true; lastSeq=-1; priorWinner=null; lastNoticeSeq=-1; myPendingTeam=null; seatReqSeqShown=null;
   joined = !!autoseat;
   showScreen(autoseat ? 'game' : 'lobby');
   openStream();
@@ -934,11 +1010,14 @@ $('enterBtn').addEventListener('click', function(){
   var name=$('nameIn').value.trim();
   if(!name){ toast('Enter a call sign.', true); $('nameIn').focus(); return; }
   localStorage.setItem('cn_name',name); localStorage.setItem('cn_team',pick.team); localStorage.setItem('cn_role',pick.role);
-  api('/join', { room:room, id:myId, name:name, team:pick.team, role:pick.role }).then(function(res){
+  api('/takeseat', { room:room, id:myId, name:name, team:pick.team, role:pick.role }).then(function(res){
     if(res && res.ok){
-      if(res.role){ pick.role=res.role; localStorage.setItem('cn_role',res.role); }
-      if(res.note) toast(res.note, true);
-      joined=true; showScreen('game');
+      if(res.applied){
+        if(res.role){ pick.role=res.role; localStorage.setItem('cn_role',res.role); }
+        joined=true; showScreen('game');
+      } else if(res.pending){
+        joined=true; myPendingTeam=res.team; openWaitingModal(res.targetName, res.team);
+      }
     }
   });
 });
@@ -949,7 +1028,7 @@ $('leaveHomeBtn').addEventListener('click', function(){ api('/leave',{room:room,
 function openSheet(){ $('menuSheet').classList.add('show'); $('scrim').classList.add('show'); renderSheet(); }
 function closeSheet(){ $('menuSheet').classList.remove('show'); $('scrim').classList.remove('show'); }
 $('menuBtn').addEventListener('click', openSheet);
-$('scrim').addEventListener('click', function(){ closeSheet(); closeModal(); });
+$('scrim').addEventListener('click', function(){ if(currentModal==='seatreq'||currentModal==='waiting') return; closeSheet(); closeModal(); });
 $('changeSeatBtn').addEventListener('click', function(){ closeSheet(); showScreen('lobby'); });
 $('leaveBtn').addEventListener('click', function(){ closeSheet(); api('/leave',{room:room,id:myId}); goHome(); });
 $('copyBtn').addEventListener('click', function(){
@@ -986,9 +1065,51 @@ function openNewRound(){
   acts.appendChild(el('button',{ class:'btn', text:'Cancel', onClick:closeModal }));
   acts.appendChild(el('button',{ class:'btn go', text:'Deal', onClick:function(){ closeModal(); api('/newgame',{ room:room, three: three?1:0 }); }}));
   card.appendChild(acts);
-  $('modal').classList.add('show'); $('scrim').classList.add('show');
+  showModalEl('newround');
 }
-function closeModal(){ $('modal').classList.remove('show'); if(!$('menuSheet').classList.contains('show')) $('scrim').classList.remove('show'); }
+function showModalEl(kind){ currentModal=kind||'modal'; $('modal').classList.add('show'); $('scrim').classList.add('show'); }
+function closeModal(){ currentModal=null; $('modal').classList.remove('show'); if(!$('menuSheet').classList.contains('show')) $('scrim').classList.remove('show'); }
+
+/* ---- seat-change requests (Spymaster seat is the only contested one) ---- */
+function openSeatReqDialog(req){
+  var card=$('modalCard'); card.innerHTML='';
+  card.appendChild(el('h3',{ text:'Seat request' }));
+  card.appendChild(el('p',{ text: req.fromName+' wants your '+TEAMS[req.team]+' Spymaster seat. If you allow it, you become an Operative on '+TEAMS[req.team]+'.' }));
+  var acts=el('div',{ class:'modal-actions' });
+  acts.appendChild(el('button',{ class:'btn', text:'Deny', onClick:function(){ closeModal(); api('/seatrespond',{ room:room, id:myId, accept:0 }); } }));
+  acts.appendChild(el('button',{ class:'btn go', text:'Allow', onClick:function(){ closeModal(); api('/seatrespond',{ room:room, id:myId, accept:1 }); } }));
+  card.appendChild(acts);
+  showModalEl('seatreq');
+}
+function openWaitingModal(targetName, team){
+  var card=$('modalCard'); card.innerHTML='';
+  card.appendChild(el('h3',{ text:'Request sent' }));
+  card.appendChild(el('p',{ text:'Waiting for '+targetName+' to hand over the '+TEAMS[team]+' Spymaster seat…' }));
+  var acts=el('div',{ class:'modal-actions' });
+  acts.appendChild(el('button',{ class:'btn', text:'Cancel request', onClick:function(){ closeModal(); api('/seatcancel',{ room:room, id:myId }); } }));
+  card.appendChild(acts);
+  showModalEl('waiting');
+}
+function handleNotice(wasFirst){
+  var n=state.notice;
+  if(n && n.seq!==lastNoticeSeq){ if(!wasFirst && n.by!==myId) toast(n.text); lastNoticeSeq=n.seq; }
+}
+function handleSeat(seat){
+  var req=state.seatRequest;
+  if(req && req.targetId===myId){
+    if(currentModal!=='seatreq'){ openSeatReqDialog(req); }
+  } else if(req && req.fromId===myId){
+    myPendingTeam=req.team;
+    if(currentModal!=='waiting'){ openWaitingModal(req.targetName, req.team); }
+  } else {
+    if(currentModal==='seatreq' || currentModal==='waiting'){ closeModal(); }
+    if(myPendingTeam!=null){
+      var mine = seat && seat.role==='spymaster' && seat.team===myPendingTeam;
+      myPendingTeam=null;
+      if(mine) showScreen('game');   // approved: the broadcast notice announces it to the table
+    }
+  }
+}
 
 /* ============================ toast ============================ */
 var toastT;
@@ -1000,11 +1121,18 @@ function mySeat(){ if(!state) return null; for(var i=0;i<state.players.length;i+
 function onState(){
   if(!state) return;
   var seat=mySeat();
-  // auto re-join after a server restart if we still hold a seat locally
-  if(joined && !seat && localStorage.getItem('cn_name') && state.teams.indexOf(pick.team)>=0){
+  var wasFirst=firstState;
+  // restore a lost seat only for someone actively on the board (e.g. after a server restart)
+  if(joined && !seat && screen==='game' && myPendingTeam==null && localStorage.getItem('cn_name') && state.teams.indexOf(pick.team)>=0){
     api('/join', { room:room, id:myId, name:localStorage.getItem('cn_name'), team:pick.team, role:pick.role });
   }
   playCues(seat);
+  handleNotice(wasFirst);
+  handleSeat(seat);
+  seat=mySeat();
+  // mirror our real seat so a restart-restore reconnects to the right role (but never
+  // override an in-progress choice on the lobby screen)
+  if(seat && screen!=='lobby'){ pick.team=seat.team; pick.role=seat.role; localStorage.setItem('cn_team',seat.team); localStorage.setItem('cn_role',seat.role); }
   if(screen==='game') renderGame(seat);
   if(screen==='lobby') renderLobby();
   if($('menuSheet').classList.contains('show')) renderSheet();
@@ -1207,19 +1335,32 @@ function renderControls(seat){
 }
 
 /* ---- keep the app inside the *visible* viewport (mobile keyboards) ---- */
+var clueFocused=false;
+function keyboardOpen(){
+  if(!window.visualViewport) return false;
+  var full=Math.max(window.innerHeight||0, document.documentElement.clientHeight||0);
+  return (full - window.visualViewport.height) > 120;
+}
+function updateKbd(){
+  var a=document.querySelector('.app'); if(!a) return;
+  // hide the board ONLY while the keyboard is actually on screen; the moment it's
+  // dismissed (even with the cursor still in the box) the board comes back.
+  a.classList.toggle('kbd', clueFocused && window.innerWidth<700 && keyboardOpen());
+}
 function fitViewport(){
   var app=document.querySelector('.app');
-  if(!app) return;
+  if(!app){ return; }
   if(window.innerWidth<700 && window.visualViewport){ app.style.height=window.visualViewport.height+'px'; }
   else { app.style.height=''; }
+  updateKbd();
 }
 if(window.visualViewport){ window.visualViewport.addEventListener('resize', fitViewport); window.visualViewport.addEventListener('scroll', fitViewport); }
 window.addEventListener('resize', fitViewport);
 window.addEventListener('orientationchange', function(){ setTimeout(fitViewport, 250); });
 
-/* collapse the board while typing a clue on phones, so it can't get squished */
-document.addEventListener('focusin', function(e){ if(e.target && e.target.id==='clueWord' && window.innerWidth<700){ var a=document.querySelector('.app'); if(a) a.classList.add('kbd'); } });
-document.addEventListener('focusout', function(e){ if(e.target && e.target.id==='clueWord'){ var a=document.querySelector('.app'); if(a) a.classList.remove('kbd'); } });
+/* track whether the clue box holds the cursor; board visibility is decided by updateKbd */
+document.addEventListener('focusin', function(e){ if(e.target && e.target.id==='clueWord'){ clueFocused=true; updateKbd(); } });
+document.addEventListener('focusout', function(e){ if(e.target && e.target.id==='clueWord'){ clueFocused=false; updateKbd(); } });
 
 /* ============================ boot ============================ */
 (function boot(){
