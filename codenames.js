@@ -545,7 +545,7 @@ const PAGE = `<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#171b24">
-<title>Codenames — Field Console</title>
+<title>Codenames</title>
 <style>
   :root{
     --ink:#151922; --panel:#1e2431; --panel2:#252c3b; --line:#39445a; --line2:#4a5670;
@@ -772,7 +772,7 @@ const PAGE = `<!DOCTYPE html>
 <div class="app">
 
   <div class="topbar">
-    <div class="brand">Codenames<span class="sub">FIELD CONSOLE</span></div>
+    <div class="brand">Codenames</div>
     <span class="codechip hidden" id="codeChip"></span>
     <div class="conn"><span class="dot" id="dot"></span><span id="connTxt"></span></div>
     <button class="iconbtn hidden" id="menuBtn" aria-label="Menu">⋯</button>
