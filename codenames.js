@@ -680,6 +680,12 @@ const PAGE = `<!DOCTYPE html>
 
   .hidden{display:none!important}
 
+  /* while typing a clue on mobile, hide the board so the 5x5 grid never squishes;
+     the clue form parks just above the keyboard. Restores on blur. */
+  .app.kbd .boardwrap{display:none}
+  .app.kbd .ticker{display:none}
+  .app.kbd .controls{margin-top:auto}
+
   /* desktop: present the app like a device */
   @media (min-width:700px){
     body{display:flex; align-items:center; justify-content:center}
@@ -1210,6 +1216,10 @@ function fitViewport(){
 if(window.visualViewport){ window.visualViewport.addEventListener('resize', fitViewport); window.visualViewport.addEventListener('scroll', fitViewport); }
 window.addEventListener('resize', fitViewport);
 window.addEventListener('orientationchange', function(){ setTimeout(fitViewport, 250); });
+
+/* collapse the board while typing a clue on phones, so it can't get squished */
+document.addEventListener('focusin', function(e){ if(e.target && e.target.id==='clueWord' && window.innerWidth<700){ var a=document.querySelector('.app'); if(a) a.classList.add('kbd'); } });
+document.addEventListener('focusout', function(e){ if(e.target && e.target.id==='clueWord'){ var a=document.querySelector('.app'); if(a) a.classList.remove('kbd'); } });
 
 /* ============================ boot ============================ */
 (function boot(){
